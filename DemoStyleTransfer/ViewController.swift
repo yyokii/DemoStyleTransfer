@@ -6,18 +6,30 @@
 //
 
 import AVFoundation
+import MetalKit
 import UIKit
 import VideoToolbox
 import Vision
 
-
 class ViewController: UIViewController {
     
+    // Camera Capture
+    private var captureSession : AVCaptureSession!
+    
+    // Metal
+    private var metalDevice : MTLDevice!
+    private var metalCommandQueue : MTLCommandQueue!
+    
+    // Core Image
+    private var ciContext : CIContext!
+    private var currentCIImage : CIImage?
+    private var outputWidth: CGFloat! // pixel
+    private var outputHeight: CGFloat! // pixel
+    
     // UI Component
-    let imageView = UIImageView()
-    let modelConfigControlItems = ["Off","CPU", "GPU", "Neural Engine"]
-    let modelConfigControl = UISegmentedControl(items: ["Off","CPU", "GPU", "Neural Engine"])
-    let parentStack = UIStackView()
+    private var mtkView: MTKView = MTKView()
+    private let modelConfigControl = UISegmentedControl(items: ["Off","CPU", "GPU", "Neural Engine"])
+    private let parentStack = UIStackView()
     
     var currentModelConfig = 0
     
@@ -25,27 +37,31 @@ class ViewController: UIViewController {
         super.viewDidLoad()
         
         setupUI()
-        setupCapture()
-    }
-    
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        
-        parentStack.frame = CGRect(x: 0, y: 0, width: view.frame.width, height: view.frame.height * 0.8)
+        setupMetal()
+        setupCoreImage()
+        setupAndStartCaptureSession()
     }
     
     func setupUI(){
-        view.addSubview(parentStack)
-        parentStack.axis = NSLayoutConstraint.Axis.vertical
-        parentStack.distribution = UIStackView.Distribution.fill
+        mtkView.translatesAutoresizingMaskIntoConstraints = false
+        modelConfigControl.translatesAutoresizingMaskIntoConstraints = false
+
+        view.addSubview(mtkView)
+        view.addSubview(modelConfigControl)
         
-        parentStack.addArrangedSubview(imageView)
-        parentStack.addArrangedSubview(modelConfigControl)
-        
-        imageView.contentMode = UIView.ContentMode.scaleAspectFit
+        NSLayoutConstraint.activate([
+            mtkView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            mtkView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            mtkView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            mtkView.topAnchor.constraint(equalTo: view.topAnchor),
+            
+            modelConfigControl.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
+            modelConfigControl.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 10),
+            modelConfigControl.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -10),
+            modelConfigControl.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -40),
+        ])
         
         modelConfigControl.selectedSegmentIndex = 0
-        
         modelConfigControl.addTarget(self, action: #selector(modelConfigChanged(_:)), for: .valueChanged)
     }
     
@@ -53,44 +69,89 @@ class ViewController: UIViewController {
         currentModelConfig = sender.selectedSegmentIndex
     }
     
-    func setupCapture() {
-        // Input Device Settings
-        let captureSession = AVCaptureSession()
-        captureSession.sessionPreset = AVCaptureSession.Preset.medium
-        let availableDevices = AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera], mediaType: AVMediaType.video, position: .back).devices
-        do {
-            if let captureDevice = availableDevices.first {
-                captureSession.addInput(try AVCaptureDeviceInput(device: captureDevice))
-            }
-        } catch {
-            print(error.localizedDescription)
+    private func setupMetal() {
+        metalDevice = MTLCreateSystemDefaultDevice()
+        mtkView.device = metalDevice
+        
+        metalCommandQueue = metalDevice.makeCommandQueue()
+        
+        mtkView.delegate = self
+        mtkView.framebufferOnly = false
+        
+        mtkView.isPaused = true
+        mtkView.enableSetNeedsDisplay = true
+    }
+    
+    private func setupCoreImage() {
+        ciContext = CIContext(mtlDevice: metalDevice)
+    }
+    
+    private func setupAndStartCaptureSession(){
+        self.captureSession = AVCaptureSession()
+        
+        // setup capture session
+        self.captureSession.beginConfiguration()
+        if self.captureSession.canSetSessionPreset(.photo) {
+            self.captureSession.sessionPreset = .photo
+        }
+        self.captureSession.automaticallyConfiguresCaptureDeviceForWideColor = true
+        self.setupInputs()
+        self.setupOutput()
+        self.captureSession.commitConfiguration()
+        
+        self.captureSession.startRunning()
+    }
+    
+    private func setupInputs(){
+        guard let backCameraDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+            fatalError("❌ no capture device")
         }
         
-        // Video output settings
+        guard let backCameraInput = try? AVCaptureDeviceInput(device: backCameraDevice) else {
+            fatalError("❌ could not create a capture input")
+        }
+        
+        if !captureSession.canAddInput(backCameraInput) {
+            fatalError("❌ could not add capture input to capture session")
+        }
+        
+        captureSession.addInput(backCameraInput)
+    }
+    
+    private func setupOutput(){
         let videoOutput = AVCaptureVideoDataOutput()
-        videoOutput.alwaysDiscardsLateVideoFrames = true
-        videoOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "videoQueue"))
-        if captureSession.canAddOutput(videoOutput){
-            captureSession.addOutput(videoOutput)
-        }
-        guard let connection = videoOutput.connection(with: .video) else { return }
-        guard connection.isVideoOrientationSupported else { return }
-        connection.videoOrientation = .portrait
+        let videoQueue = DispatchQueue(label: "videoQueue", qos: .userInteractive)
+        videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
         
-        let previewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
-        view.layer.addSublayer(previewLayer)
-        captureSession.startRunning()
+        if captureSession.canAddOutput(videoOutput) {
+            captureSession.addOutput(videoOutput)
+        } else {
+            fatalError("❌ could not add video output")
+        }
+        
+        videoOutput.connections.first?.videoOrientation = .portrait
     }
 }
 
 extension ViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
-    
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         
-        guard currentModelConfig != 0 && (currentModelConfig < modelConfigControlItems.count) else {
-            DispatchQueue.main.async(execute: {
-                self.imageView.image = .init(buffer: sampleBuffer)
-            })
+        guard currentModelConfig != 0 else {
+            guard let cvBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+                return
+            }
+            let ciImage = CIImage(cvImageBuffer: cvBuffer)
+            
+            if (outputWidth == nil) || (outputHeight == nil) {
+                outputWidth = ciImage.extent.width
+                outputHeight = ciImage.extent.height
+            }
+            
+            self.currentCIImage = ciImage
+            
+            DispatchQueue.main.async {
+                self.mtkView.setNeedsDisplay()
+            }
             return
         }
         
@@ -107,52 +168,70 @@ extension ViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let model = try? VNCoreMLModel(for: DemoStyleTransfer02_usecase_image.init(configuration: config).model) else { return }
         
         // Create Vision Request
-        let request = VNCoreMLRequest(model: model) { (finishedRequest, error) in
+        let request = VNCoreMLRequest(model: model) { [weak self] (finishedRequest, error) in
+            guard let self = self else { return }
             guard let results = finishedRequest.results as? [VNPixelBufferObservation] else { return }
             
             guard let observation = results.first else { return }
             
-            DispatchQueue.main.async(execute: {
-                self.imageView.image = UIImage(pixelBuffer: observation.pixelBuffer)
-            })
+            let pixelBuffer = observation.pixelBuffer
+            var ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+            let scaleX = self.outputWidth / ciImage.extent.width
+            let scaleY = self.outputHeight / ciImage.extent.height
+            
+            ciImage = ciImage.resizeAffine(scaleX: scaleX, scaleY: scaleY)!
+
+            self.currentCIImage = ciImage
+                        
+            DispatchQueue.main.async {
+                self.mtkView.setNeedsDisplay()
+            }
         }
+        
+        request.imageCropAndScaleOption = .scaleFill
         
         guard let pixelBuffer: CVPixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         try? VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:]).perform([request])
-        
     }
 }
 
-extension UIImage {
-    
-    /// CVPixelBuffer to UIImage
-    public convenience init?(pixelBuffer: CVPixelBuffer) {
-        var cgImage: CGImage?
-        VTCreateCGImageFromCVPixelBuffer(pixelBuffer, options: nil, imageOut: &cgImage)
-        
-        if let cgImage = cgImage {
-            self.init(cgImage: cgImage)
-        } else {
-            return nil
-        }
+extension ViewController: MTKViewDelegate {
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        print("\(self.classForCoder)/" + #function)
     }
     
-    /// CMSampleBuffer to UIImage
-    public convenience init?(buffer: CMSampleBuffer) {
-        let pixelBuffer: CVImageBuffer = CMSampleBufferGetImageBuffer(buffer)!
-        
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        
-        let pixelBufferWidth = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
-        let pixelBufferHeight = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
-        let imageRect: CGRect = CGRect(x: 0, y: 0, width: pixelBufferWidth, height: pixelBufferHeight)
-        let ciContext = CIContext.init()
-        let cgImage = ciContext.createCGImage(ciImage, from: imageRect )
-        
-        if let cgImage = cgImage {
-            self.init(cgImage: cgImage)
-        } else {
-            return nil
+    func draw(in view: MTKView) {
+        guard let commandBuffer = metalCommandQueue.makeCommandBuffer() else {
+            return
         }
+        
+        guard let ciImage = currentCIImage else {
+            return
+        }
+        
+        guard let currentDrawable = view.currentDrawable else {
+            return
+        }
+        
+        let heightOfciImage = ciImage.extent.height
+        let heightOfDrawable = view.drawableSize.height
+        let yOffsetFromBottom = (heightOfDrawable - heightOfciImage)/2
+        
+        ciContext.render(ciImage,
+                         to: currentDrawable.texture,
+                         commandBuffer: commandBuffer,
+                         bounds: CGRect(origin: CGPoint(x: 0, y: -yOffsetFromBottom), size: view.drawableSize),
+                         colorSpace: CGColorSpaceCreateDeviceRGB())
+        
+        commandBuffer.present(currentDrawable)
+        commandBuffer.commit()
+    }
+}
+
+extension CIImage {
+
+   func resizeAffine(scaleX: CGFloat, scaleY: CGFloat) -> CIImage? {
+         let matrix = CGAffineTransform(scaleX: scaleX, y: scaleY)
+       return transformed(by: matrix)
     }
 }
